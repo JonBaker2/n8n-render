@@ -1,0 +1,125 @@
+# .github/workflows/n8n-auto-update.yml
+name: N8N Auto-Update
+
+on:
+  schedule:
+    # Check for updates every 6 hours - FIXED SYNTAX
+    - cron: '0 */6 * * *'
+  workflow_dispatch:  # Allow manual trigger
+  repository_dispatch:
+    types: [n8n-update-check]
+
+env:
+  RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+  SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+
+jobs:
+  check-and-update:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Get current N8N version
+      id: current-version
+      run: |
+        if [ -f ".n8n-version" ]; then
+          echo "version=$(cat .n8n-version)" >> $GITHUB_OUTPUT
+        else
+          echo "version=unknown" >> $GITHUB_OUTPUT
+        fi
+        
+    - name: Get latest N8N version
+      id: latest-version
+      run: |
+        LATEST=$(curl -s https://api.github.com/repos/n8n-io/n8n/releases/latest | jq -r '.tag_name' | sed 's/^n8n@//')
+        echo "version=$LATEST" >> $GITHUB_OUTPUT
+        echo "Latest N8N version: $LATEST"
+        
+    - name: Compare versions
+      id: compare
+      run: |
+        CURRENT="${{ steps.current-version.outputs.version }}"
+        LATEST="${{ steps.latest-version.outputs.version }}"
+        
+        if [ "$CURRENT" != "$LATEST" ]; then
+          echo "update-needed=true" >> $GITHUB_OUTPUT
+          echo "New version available: $CURRENT -> $LATEST"
+        else
+          echo "update-needed=false" >> $GITHUB_OUTPUT
+          echo "N8N is up to date: $CURRENT"
+        fi
+        
+    - name: Update version tracking
+      if: steps.compare.outputs.update-needed == 'true'
+      run: |
+        LATEST="${{ steps.latest-version.outputs.version }}"
+        
+        # Update version file for tracking
+        echo "$LATEST" > .n8n-version
+        
+    - name: Commit version update
+      if: steps.compare.outputs.update-needed == 'true'
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add .n8n-version
+        git commit -m "chore: update N8N version tracking to ${{ steps.latest-version.outputs.version }}" || exit 0
+        git push
+        
+    - name: Trigger Render deployment
+      if: steps.compare.outputs.update-needed == 'true'
+      run: |
+        if [ -n "$RENDER_DEPLOY_HOOK" ]; then
+          echo "Triggering Render deployment..."
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$RENDER_DEPLOY_HOOK")
+          if [ "$RESPONSE" = "200" ] || [ "$RESPONSE" = "201" ]; then
+            echo "✅ Deployment triggered successfully!"
+          else
+            echo "❌ Deployment trigger failed with status: $RESPONSE"
+            exit 1
+          fi
+        else
+          echo "❌ No Render deploy hook configured"
+          exit 1
+        fi
+        
+    - name: Send Slack notification
+      if: steps.compare.outputs.update-needed == 'true' && env.SLACK_WEBHOOK != ''
+      run: |
+        curl -X POST "$SLACK_WEBHOOK" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "text": "🚀 N8N Auto-Update Triggered",
+            "attachments": [
+              {
+                "color": "good",
+                "fields": [
+                  {
+                    "title": "Previous Version",
+                    "value": "${{ steps.current-version.outputs.version }}",
+                    "short": true
+                  },
+                  {
+                    "title": "New Version", 
+                    "value": "${{ steps.latest-version.outputs.version }}",
+                    "short": true
+                  },
+                  {
+                    "title": "Status",
+                    "value": "Deployment triggered on Render",
+                    "short": false
+                  }
+                ]
+              }
+            ]
+          }'
+          
+    - name: Log completion
+      run: |
+        if [ "${{ steps.compare.outputs.update-needed }}" = "true" ]; then
+          echo "🚀 Update process completed for N8N version ${{ steps.latest-version.outputs.version }}"
+        else
+          echo "✅ N8N is already up to date (version ${{ steps.latest-version.outputs.version }})"
+        fi
